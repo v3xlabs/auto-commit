@@ -1,25 +1,41 @@
 [package]
-license = "MIT"
-edition = "2021"
-version = "0.1.4"
 name = "auto-commit"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
 readme = "README.md"
 categories = ["command-line-utilities"]
-homepage = "https://github.com/m1guelpf/auto-commit"
-repository = "https://github.com/m1guelpf/auto-commit"
+homepage = "https://github.com/v3xlabs/auto-commit"
+repository = "https://github.com/v3xlabs/auto-commit"
 description = "Automagically generate commit messages."
-authors = ["Miguel Piedrafita <soy@miguelpiedrafita.com>"]
+authors = [
+    "Miguel Piedrafita <soy@miguelpiedrafita.com>",
+    "Luc van Kampen <luc.van.kampen@ethereum.org>",
+]
 
 [dependencies]
-rand = "0.8.5"
-serde = "1.0.164"
-spinners = "4.1.0"
-question = "0.2.2"
-schemars = "0.8.12"
-serde_json = "1.0.99"
-env_logger = "0.10.0"
-clap-verbosity-flag = "2.0.0"
-log = { version = "0.4.8", features = ["std"] }
-tokio = { version = "1.28.2", features = ["full"] }
-clap = { version = "4.0.18", features = ["derive"] }
-async-openai = { version = "0.12.0", default-features = false, features = ["native-tls"] }
+async-openai = { version = "0.41", default-features = false, features = ["chat-completion", "native-tls", "byot"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+futures = "0.3"
+globset = "0.4"
+indicatif = "0.18"
+crossterm = "0.29"
+inquire = "0.9"
+owo-colors = { version = "4", features = ["supports-colors"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
+toml = "1"
+
+[build-dependencies]
+clap = { version = "4.6", features = ["derive", "env"] }
+clap_complete = "4.6"
+clap_mangen = "0.3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

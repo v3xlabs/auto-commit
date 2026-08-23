@@ -1,275 +1,175 @@
-use async_openai::{
-    config::OpenAIConfig,
-    types::{
-        ChatCompletionFunctionCall, ChatCompletionFunctions, ChatCompletionRequestMessage,
-        CreateChatCompletionRequestArgs, FunctionCall, Role,
-    },
-};
+mod branch;
+mod cli;
+mod commit;
+mod config;
+mod git;
+mod model;
+mod output;
+mod picker;
+mod squash;
+
+use std::process::ExitCode;
+
 use clap::Parser;
-use clap_verbosity_flag::{InfoLevel, Verbosity};
-use log::{error, info};
-use question::{Answer, Question};
-use rand::seq::SliceRandom;
-use schemars::{
-    gen::{SchemaGenerator, SchemaSettings},
-    JsonSchema,
-};
-use serde_json::json;
-use spinners::{Spinner, Spinners};
-use std::{
-    io::Write,
-    process::{Command, Stdio},
-    str,
+
+use crate::{
+    cli::{Cli, Command, ConfigAction},
+    config::{Config, ConfigError},
+    git::GitError,
+    model::ModelError,
+    output::{Event, Reporter},
 };
 
-#[derive(Parser)]
-#[command(version)]
-#[command(name = "Auto Commit")]
-#[command(author = "Miguel Piedrafita <soy@miguelpiedrafita.com>")]
-#[command(about = "Automagically generate commit messages.", long_about = None)]
-struct Cli {
-    #[clap(flatten)]
-    verbose: Verbosity<InfoLevel>,
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Git(#[from] GitError),
 
-    #[arg(
-        long = "dry-run",
-        help = "Output the generated message, but don't create a commit."
-    )]
-    dry_run: bool,
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 
-    #[arg(
-        short,
-        long,
-        help = "Edit the generated commit message before committing."
-    )]
-    review: bool,
+    #[error(transparent)]
+    Model(#[from] ModelError),
 
-    #[arg(short, long, help = "Don't ask for confirmation before committing.")]
-    force: bool,
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("aborted")]
+    Aborted,
+
+    #[error("HEAD is detached, so there is no branch to name")]
+    DetachedHead,
+
+    #[error("{0} is the default branch, so there is nothing to rename")]
+    OnDefaultBranch(String),
+
+    #[error("{0} has no commits that {1} does not already have")]
+    NoCommitsOnBranch(String, String),
+
+    #[error("every suggested name is already taken")]
+    NoUsableName,
+
+    #[error("this branch has {0} commits that the base does not, so there is nothing to squash")]
+    NothingToSquash(usize),
+
+    #[error("$EDITOR is not set")]
+    NoEditor,
 }
 
-#[derive(Debug, serde::Deserialize, JsonSchema)]
-struct Commit {
-    /// The title of the commit.
-    title: String,
+impl Error {
+    /// The stable identifier a caller matches on. It is the same string in the
+    /// JSON error event and in the exit code table.
+    fn code(&self) -> &'static str {
+        match self {
+            Error::Git(GitError::NotARepository) => "not_a_repository",
+            Error::Git(GitError::NothingStaged) => "no_staged_changes",
+            Error::Git(_) => "git_failed",
+            Error::Config(ConfigError::NoApiKey) => "no_api_key",
+            Error::Config(_) => "bad_config",
+            Error::Model(_) => "model_error",
+            Error::Io(_) => "io_error",
+            Error::Aborted => "aborted",
+            Error::DetachedHead => "detached_head",
+            Error::OnDefaultBranch(_) => "on_default_branch",
+            Error::NoCommitsOnBranch(..) => "no_commits_on_branch",
+            Error::NoUsableName => "no_usable_name",
+            Error::NothingToSquash(_) => "nothing_to_squash",
+            Error::NoEditor => "no_editor",
+        }
+    }
 
-    /// An exhaustive description of the changes.
-    description: String,
-}
-
-impl ToString for Commit {
-    fn to_string(&self) -> String {
-        format!("{}\n\n{}", self.title, self.description)
+    fn exit_code(&self) -> u8 {
+        match self {
+            Error::Git(GitError::NothingStaged) => 2,
+            Error::Git(GitError::NotARepository) => 3,
+            Error::Config(ConfigError::NoApiKey) => 4,
+            Error::Model(_) => 5,
+            Error::Aborted => 130,
+            _ => 1,
+        }
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), ()> {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
-    env_logger::Builder::new()
-        .filter_level(cli.verbose.log_level_filter())
-        .init();
+    let mut reporter = Reporter::new(&cli.global);
 
-    let api_token = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| {
-        error!("Please set the OPENAI_API_KEY environment variable.");
-        std::process::exit(1);
-    });
+    let result = dispatch(&cli, &mut reporter).await;
 
-    let git_staged_cmd = Command::new("git")
-        .arg("diff")
-        .arg("--staged")
-        .output()
-        .expect("Couldn't find diff.")
-        .stdout;
+    match result {
+        Ok(()) => {
+            reporter.finish();
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            reporter.event(Event::Error {
+                code: error.code(),
+                message: error.to_string(),
+            });
 
-    let git_staged_cmd = str::from_utf8(&git_staged_cmd).unwrap();
-
-    if git_staged_cmd.is_empty() {
-        error!("There are no staged files to commit.\nTry running `git add` to stage some files.");
+            reporter.finish();
+            ExitCode::from(error.exit_code())
+        }
     }
+}
 
-    let is_repo = Command::new("git")
-        .arg("rev-parse")
-        .arg("--is-inside-work-tree")
-        .output()
-        .expect("Failed to check if this is a git repository.")
-        .stdout;
-
-    if str::from_utf8(&is_repo).unwrap().trim() != "true" {
-        error!("It looks like you are not in a git repository.\nPlease run this command from the root of a git repository, or initialize one using `git init`.");
-        std::process::exit(1);
+async fn dispatch(cli: &Cli, reporter: &mut Reporter) -> Result<(), Error> {
+    match &cli.command {
+        None => commit::run(&cli.commit, &cli.global, reporter).await,
+        Some(Command::Commit(args)) => commit::run(args, &cli.global, reporter).await,
+        Some(Command::Branch(args)) => branch::run(args, &cli.global, reporter).await,
+        Some(Command::Squash(args)) => squash::run(args, &cli.global, reporter).await,
+        Some(Command::Config { action }) => configure(action, cli, reporter).await,
     }
+}
 
-    let client = async_openai::Client::with_config(OpenAIConfig::new().with_api_key(api_token));
+async fn configure(action: &ConfigAction, cli: &Cli, reporter: &mut Reporter) -> Result<(), Error> {
+    match action {
+        ConfigAction::Path => {
+            reporter.payload(&config::user_path().display().to_string());
+        }
 
-    let output = Command::new("git")
-        .arg("diff")
-        .arg("HEAD")
-        .output()
-        .expect("Couldn't find diff.")
-        .stdout;
-    let output = str::from_utf8(&output).unwrap();
+        ConfigAction::Get { key } => {
+            let root = git::repo_root().await.ok();
+            let config = Config::load(root.as_ref(), &cli.global)?;
 
-    if !cli.dry_run {
-        info!("Loading Data...");
-    }
-
-    let sp: Option<Spinner> = if !cli.dry_run && cli.verbose.is_silent() {
-        let vs = [
-            Spinners::Earth,
-            Spinners::Aesthetic,
-            Spinners::Hearts,
-            Spinners::BoxBounce,
-            Spinners::BoxBounce2,
-            Spinners::BouncingBar,
-            Spinners::Christmas,
-            Spinners::Clock,
-            Spinners::FingerDance,
-            Spinners::FistBump,
-            Spinners::Flip,
-            Spinners::Layer,
-            Spinners::Line,
-            Spinners::Material,
-            Spinners::Mindblown,
-            Spinners::Monkey,
-            Spinners::Noise,
-            Spinners::Point,
-            Spinners::Pong,
-            Spinners::Runner,
-            Spinners::SoccerHeader,
-            Spinners::Speaker,
-            Spinners::SquareCorners,
-            Spinners::Triangle,
-        ];
-
-        let spinner = vs.choose(&mut rand::thread_rng()).unwrap().clone();
-
-        Some(Spinner::new(spinner, "Analyzing Codebase...".into()))
-    } else {
-        None
-    };
-
-    let mut generator = SchemaGenerator::new(SchemaSettings::openapi3().with(|settings| {
-        settings.inline_subschemas = true;
-    }));
-
-    let commit_schema = generator.subschema_for::<Commit>().into_object();
-
-    let completion = client
-        .chat()
-        .create(
-            CreateChatCompletionRequestArgs::default()
-                .messages(vec![
-                    ChatCompletionRequestMessage {
-                        role: Role::System,
-                        content: Some(
-                            "You are an experienced programmer who writes great commit messages."
-                                .to_string(),
-                        ),
-                        ..Default::default()
-                    },
-                    ChatCompletionRequestMessage {
-                        role: Role::Assistant,
-                        content: Some("".to_string()),
-                        function_call: Some(FunctionCall {
-                            arguments: "{}".to_string(),
-                            name: "get_diff".to_string(),
-                        }),
-                        ..Default::default()
-                    },
-                    ChatCompletionRequestMessage {
-                        role: Role::Function,
-                        content: Some(output.to_string()),
-                        name: Some("get_diff".to_string()),
-                        ..Default::default()
-                    },
-                ])
-                .functions(vec![
-                    ChatCompletionFunctions {
-                        name: "get_diff".to_string(),
-                        description: Some(
-                            "Returns the output of `git diff HEAD` as a string.".to_string(),
-                        ),
-                        parameters: Some(json!({
-                            "type": "object",
-                            "properties": {}
-                        })),
-                    },
-                    ChatCompletionFunctions {
-                        name: "commit".to_string(),
-                        description: Some(
-                            "Creates a commit with the given title and a description.".to_string(),
-                        ),
-                        parameters: Some(serde_json::to_value(commit_schema).unwrap()),
-                    },
-                ])
-                .function_call(ChatCompletionFunctionCall::Object(
-                    json!({ "name": "commit" }),
-                ))
-                .model("gpt-3.5-turbo-16k")
-                .temperature(0.0)
-                .max_tokens(2000u16)
-                .build()
-                .unwrap(),
-        )
-        .await
-        .expect("Couldn't complete prompt.");
-
-    if sp.is_some() {
-        sp.unwrap().stop_with_message("Finished Analyzing!".into());
-    }
-
-    let commit_data = &completion.choices[0].message.function_call;
-    let commit_msg = serde_json::from_str::<Commit>(&commit_data.as_ref().unwrap().arguments)
-        .expect("Couldn't parse model response.")
-        .to_string();
-
-    if cli.dry_run {
-        info!("{}", commit_msg);
-        return Ok(());
-    } else {
-        info!(
-            "Proposed Commit:\n------------------------------\n{}\n------------------------------",
-            commit_msg
-        );
-
-        if !cli.force {
-            let answer = Question::new("Do you want to continue? (Y/n)")
-                .yes_no()
-                .until_acceptable()
-                .default(Answer::YES)
-                .ask()
-                .expect("Couldn't ask question.");
-
-            if answer == Answer::NO {
-                error!("Commit aborted by user.");
-                std::process::exit(1);
+            match key {
+                Some(key) => reporter.payload(&config.get(key)?),
+                None => {
+                    for key in Config::KEYS {
+                        reporter.payload(&format!("{key} = {}", config.get(key)?));
+                    }
+                }
             }
-            info!("Committing Message...");
+        }
+
+        ConfigAction::Set { key, value } => {
+            let path = config::set(key, value)?;
+            reporter.payload(&format!("{key} written to {}", path.display()));
+        }
+
+        ConfigAction::Edit => {
+            let path = config::user_path();
+
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let editor = editor().ok_or(Error::NoEditor)?;
+
+            std::process::Command::new(editor).arg(&path).status()?;
         }
     }
 
-    let mut ps_commit = Command::new("git")
-        .arg("commit")
-        .args(if cli.review { vec!["-e"] } else { vec![] })
-        .arg("-F")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let mut stdin = ps_commit.stdin.take().expect("Failed to open stdin");
-    std::thread::spawn(move || {
-        stdin
-            .write_all(commit_msg.as_bytes())
-            .expect("Failed to write to stdin");
-    });
-
-    let commit_output = ps_commit
-        .wait_with_output()
-        .expect("There was an error when creating the commit.");
-
-    info!("{}", str::from_utf8(&commit_output.stdout).unwrap());
-
     Ok(())
+}
+
+/// The editor the user prefers, if they have said. `VISUAL` wins over
+/// `EDITOR` because that is the order every other tool uses.
+pub fn editor() -> Option<String> {
+    std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .ok()
+        .filter(|editor| !editor.trim().is_empty())
 }
