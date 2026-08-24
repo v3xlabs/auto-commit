@@ -135,7 +135,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: "gpt-4.1-mini".into(),
+            model: "gpt-5.6-luna".into(),
             endpoint: "https://api.openai.com/v1".into(),
             api_key_file: None,
             endpoint_file: None,

@@ -6,7 +6,9 @@ mod git;
 mod model;
 mod output;
 mod picker;
+mod screen;
 mod squash;
+mod staged;
 
 use std::process::ExitCode;
 

@@ -472,6 +472,13 @@ pub async fn staged_diff(config: &Config) -> Result<Diff, GitError> {
     build_diff(config, &numstat, &diff)
 }
 
+/// A cheap stand-in for the staged change, used to notice that the index has
+/// moved without reading the whole diff again. `--raw` names both blob ids,
+/// so a file edited in place changes this as surely as one newly added.
+pub async fn staged_fingerprint() -> String {
+    git(["diff", "--staged", "--raw"]).await.unwrap_or_default()
+}
+
 /// The same split applied to a diff that did not come from git, for
 /// `--stdin-diff`. Callers that supply their own diff get no numstat, so the
 /// counts come from the hunks.

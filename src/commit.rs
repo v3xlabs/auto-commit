@@ -13,7 +13,7 @@ use crate::{
     git::{self, CommitOptions, Diff, GitError},
     model::{self, Model, ModelError},
     output::{Event, Reporter},
-    picker, Error,
+    picker, staged, Error,
 };
 
 /// One proposed commit message. The subject and body stay apart until the
@@ -67,112 +67,131 @@ pub async fn run(
 
     // No spinner yet. Reading the diff is instant, and starting one here made
     // the tool look like it was working before it had even found a change.
-    let diff = if args.stdin_diff {
+    let mut diff = if args.stdin_diff {
         let mut text = String::new();
         std::io::stdin().read_to_string(&mut text)?;
         git::diff_from_text(&config, &text)?
     } else {
         match git::staged_diff(&config).await {
             Ok(diff) => diff,
-            Err(GitError::NothingStaged) => return nothing_staged(reporter).await,
+            Err(GitError::NothingStaged) => return Err(nothing_staged(reporter).await),
             Err(error) => return Err(error.into()),
         }
     };
 
-    let paths = diff.paths();
-
-    let (recent, touching, template, branch) = tokio::join!(
-        git::recent_commits(config.context_commits),
-        git::commits_touching(&paths, config.context_commits),
-        git::commit_template(&root),
-        git::branch_name(),
-    );
-
-    // How many commit examples actually reached the prompt, which is not the
-    // configured count when the repository is younger than that.
-    let commits_used = recent
-        .as_deref()
-        .map_or(0, |log| log.lines().filter(|line| *line == "---").count())
-        + touching.as_deref().map_or(0, |log| log.lines().count());
-
-    let (added, deleted) = diff.totals();
-
-    reporter.event(Event::Context {
-        staged_files: diff.files.len(),
-        included: diff.included_paths().len(),
-        withheld: diff.withheld_paths(),
-        added,
-        deleted,
-        diff_bytes: diff.included.len(),
-        commits_used,
-        model: config.model.clone(),
-    });
+    // Nothing is sent until you say so, so the staging area can go on
+    // changing while the screen is up. `--yes` and `--print` have already
+    // said go, and a diff read from stdin cannot change.
+    if interactive(reporter) && !args.yes && !global.print {
+        diff = staged::watch(&config, diff).await?;
+    }
 
     let model = Model::new(&config)?;
-
-    // Each rejected round stays in the conversation, so a second attempt
-    // knows what it already proposed and why you did not want it.
-    let mut messages = vec![
-        model::system(system_prompt(&config, args)),
-        model::user(context_prompt(
-            recent.as_deref(),
-            touching.as_deref(),
-            template.as_deref(),
-            branch.as_deref(),
-            &diff,
-        )),
-    ];
-
     let mut review = args.review;
 
-    let chosen = 'rounds: loop {
-        reporter.start("writing the message");
+    // A reload starts here rather than in the round below, because what is
+    // staged has changed: the context, the prompt and the conversation all
+    // have to be built again from the diff that is there now.
+    let chosen = 'session: loop {
+        let paths = diff.paths();
 
-        let candidates = generate(&model, &config, messages.clone(), &diff, reporter).await?;
+        let (recent, touching, template, branch) = tokio::join!(
+            git::recent_commits(config.context_commits),
+            git::commits_touching(&paths, config.context_commits),
+            git::commit_template(&root),
+            git::branch_name(),
+        );
 
-        reporter.settle();
+        // How many commit examples actually reached the prompt, which is not
+        // the configured count when the repository is younger than that.
+        let commits_used = recent
+            .as_deref()
+            .map_or(0, |log| log.lines().filter(|line| *line == "---").count())
+            + touching.as_deref().map_or(0, |log| log.lines().count());
 
-        // An empty list is the model failing to answer, not the user
-        // declining, so it must not be reported as an abort.
-        if candidates.is_empty() {
-            return Err(ModelError::Empty.into());
-        }
+        let (added, deleted) = diff.totals();
 
-        // Rejecting the whole round and rejecting the one you picked mean the
-        // same thing to the model, so both come back here.
-        let feedback = match choose(&candidates, reporter)? {
-            Pick::Cancel => return Err(Error::Aborted),
-            Pick::Feedback(feedback) => feedback,
-            // An edited message goes straight through. It is yours now, so
-            // there is nothing left to confirm about the wording.
-            Pick::Edit(index) => match edit(&candidates[index]).await? {
-                Some(edited) => break 'rounds edited,
-                None => return Err(Error::Aborted),
-            },
-            Pick::Message(index) => {
-                let chosen = candidates[index].clone();
+        reporter.event(Event::Context {
+            staged_files: diff.files.len(),
+            included: diff.included_paths().len(),
+            withheld: diff.withheld_paths(),
+            added,
+            deleted,
+            diff_bytes: diff.included.len(),
+            commits_used,
+            model: config.model.clone(),
+        });
 
-                if global.print || args.yes {
-                    break 'rounds chosen;
-                }
+        // Each rejected round stays in the conversation, so a second attempt
+        // knows what it already proposed and why you did not want it.
+        let mut messages = vec![
+            model::system(system_prompt(&config, args)),
+            model::user(context_prompt(
+                recent.as_deref(),
+                touching.as_deref(),
+                template.as_deref(),
+                branch.as_deref(),
+                &diff,
+            )),
+        ];
 
-                match confirm(&chosen, &config, reporter)? {
-                    Decision::Commit => break 'rounds chosen,
-                    Decision::Edit => {
-                        review = true;
-                        break 'rounds chosen;
-                    }
-                    Decision::Cancel => return Err(Error::Aborted),
-                    Decision::Feedback(feedback) => feedback,
-                }
+        loop {
+            reporter.start("writing the message");
+
+            let candidates = generate(&model, &config, messages.clone(), &diff, reporter).await?;
+
+            reporter.settle();
+
+            // An empty list is the model failing to answer, not the user
+            // declining, so it must not be reported as an abort.
+            if candidates.is_empty() {
+                return Err(ModelError::Empty.into());
             }
-        };
 
-        messages.push(model::assistant(proposal_summary(&candidates)));
-        messages.push(model::user(format!(
-            "None of those are right. {feedback}\n\nPropose {} new ones that answer that.",
-            config.candidates.max(1)
-        )));
+            // Rejecting the whole round and rejecting the one you picked mean
+            // the same thing to the model, so both come back here.
+            let feedback = match choose(&candidates, reporter)? {
+                Pick::Cancel => return Err(Error::Aborted),
+                Pick::Feedback(feedback) => feedback,
+                Pick::Reload => {
+                    diff = reload(&config, reporter).await?;
+                    continue 'session;
+                }
+                // An edited message goes straight through. It is yours now, so
+                // there is nothing left to confirm about the wording.
+                Pick::Edit(index) => match edit(&candidates[index]).await? {
+                    Some(edited) => break 'session edited,
+                    None => return Err(Error::Aborted),
+                },
+                Pick::Message(index) => {
+                    let chosen = candidates[index].clone();
+
+                    if global.print || args.yes {
+                        break 'session chosen;
+                    }
+
+                    match confirm(&chosen, &config, reporter)? {
+                        Decision::Commit => break 'session chosen,
+                        Decision::Edit => {
+                            review = true;
+                            break 'session chosen;
+                        }
+                        Decision::Cancel => return Err(Error::Aborted),
+                        Decision::Reload => {
+                            diff = reload(&config, reporter).await?;
+                            continue 'session;
+                        }
+                        Decision::Feedback(feedback) => feedback,
+                    }
+                }
+            };
+
+            messages.push(model::assistant(proposal_summary(&candidates)));
+            messages.push(model::user(format!(
+                "None of those are right. {feedback}\n\nPropose {} new ones that answer that.",
+                config.candidates.max(1)
+            )));
+        }
     };
 
     reporter.event(Event::Message {
@@ -204,13 +223,23 @@ pub async fn run(
     Ok(())
 }
 
+/// Reads the staging area again for another round. What is staged now is what
+/// the next messages describe, so nothing of the last round is carried over.
+async fn reload(config: &Config, reporter: &mut Reporter) -> Result<Diff, Error> {
+    match git::staged_diff(config).await {
+        Ok(diff) => Ok(diff),
+        Err(GitError::NothingStaged) => Err(nothing_staged(reporter).await),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Nothing staged is the case the tool is reached for most often, so it says
 /// what is there rather than only what is missing.
 ///
 /// It does not stage anything. Choosing what goes in a commit is the user's
 /// job, and a tool that runs `git add` on their behalf is doing the one part
 /// of the work they should not delegate.
-async fn nothing_staged(reporter: &mut Reporter) -> Result<(), Error> {
+async fn nothing_staged(reporter: &mut Reporter) -> Error {
     let dirty = git::unstaged_files().await;
 
     // The list only, with no heading of its own. The error printed after it
@@ -228,7 +257,7 @@ async fn nothing_staged(reporter: &mut Reporter) -> Result<(), Error> {
         eprintln!();
     }
 
-    Err(GitError::NothingStaged.into())
+    GitError::NothingStaged.into()
 }
 
 fn interactive(reporter: &Reporter) -> bool {
@@ -240,6 +269,7 @@ enum Decision {
     Commit,
     Edit,
     Feedback(String),
+    Reload,
     Cancel,
 }
 
@@ -248,6 +278,7 @@ enum Pick {
     Message(usize),
     Edit(usize),
     Feedback(String),
+    Reload,
     Cancel,
 }
 
@@ -319,6 +350,7 @@ fn choose(candidates: &[Message], reporter: &Reporter) -> Result<Pick, Error> {
         picker::Choice::Item(index) => Pick::Message(index),
         picker::Choice::Edit(index) => Pick::Edit(index),
         picker::Choice::Feedback(text) => Pick::Feedback(text),
+        picker::Choice::Reload => Pick::Reload,
         picker::Choice::Cancel => Pick::Cancel,
     })
 }
@@ -379,7 +411,13 @@ fn confirm(message: &Message, config: &Config, reporter: &Reporter) -> Result<De
 
     let chosen = inquire::Select::new(
         "Commit this?",
-        vec!["commit", "edit first", "try again, with feedback", "cancel"],
+        vec![
+            "commit",
+            "edit first",
+            "try again, with feedback",
+            "reload the staged change and try again",
+            "cancel",
+        ],
     )
     .raw_prompt()
     .map_err(|_| Error::Aborted)?;
@@ -391,6 +429,7 @@ fn confirm(message: &Message, config: &Config, reporter: &Reporter) -> Result<De
             Ok(feedback) if !feedback.trim().is_empty() => Decision::Feedback(feedback),
             _ => Decision::Cancel,
         },
+        3 => Decision::Reload,
         _ => Decision::Cancel,
     })
 }
