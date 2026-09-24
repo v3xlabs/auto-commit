@@ -98,13 +98,79 @@ pub async fn commit_template(root: &Path) -> Option<String> {
         .filter(|text| !text.trim().is_empty())
 }
 
-pub async fn recent_commits(count: usize) -> Option<String> {
-    git_opt([
+/// One commit from the history, as an example of the convention in use.
+pub struct PastCommit {
+    pub subject: String,
+    /// The body with its trailers removed. A `Co-authored-by:` line is added
+    /// by a tool, not written by a person, so it does not count as a body.
+    pub body: String,
+}
+
+/// The most recent commits by any of `authors`, or by anyone when none of
+/// them has committed here yet.
+pub async fn recent_commits(count: usize, authors: &[String]) -> Vec<PastCommit> {
+    if !authors.is_empty() {
+        let own = log_commits(count, authors).await;
+
+        if !own.is_empty() {
+            return own;
+        }
+    }
+
+    log_commits(count, &[]).await
+}
+
+async fn log_commits(count: usize, authors: &[String]) -> Vec<PastCommit> {
+    let mut args = vec![
         "log".to_owned(),
         format!("-n{count}"),
-        "--format=%s%n%b%n---".to_owned(),
-    ])
-    .await
+        "--format=%x1e%s%n%b".to_owned(),
+        // Several --author patterns match any of them. Fixed strings, because
+        // an address is full of regex metacharacters.
+        "--fixed-strings".to_owned(),
+    ];
+    args.extend(authors.iter().map(|email| format!("--author=<{email}>")));
+
+    git_opt(args)
+        .await
+        .map(|log| parse_log(&log))
+        .unwrap_or_default()
+}
+
+fn parse_log(log: &str) -> Vec<PastCommit> {
+    log.split('\x1e')
+        .filter(|record| !record.trim().is_empty())
+        .map(|record| {
+            let (subject, body) = record.split_once('\n').unwrap_or((record, ""));
+
+            PastCommit {
+                subject: subject.trim().to_owned(),
+                body: without_trailers(body.trim()).to_owned(),
+            }
+        })
+        .collect()
+}
+
+/// The body minus its final paragraph when every line of that paragraph is a
+/// `Token: value` trailer or a folded continuation of one.
+fn without_trailers(body: &str) -> &str {
+    let (head, last) = body.rsplit_once("\n\n").unwrap_or(("", body));
+
+    let is_trailer = |line: &str| {
+        line.starts_with(char::is_whitespace)
+            || line.split_once(": ").is_some_and(|(token, _)| {
+                !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|char| char.is_ascii_alphanumeric() || char == '-')
+            })
+    };
+
+    if !last.is_empty() && last.lines().all(is_trailer) {
+        head.trim_end()
+    } else {
+        body
+    }
 }
 
 /// Commits touching the same files as the staged change. These carry the
@@ -743,5 +809,20 @@ mod tests {
             build_diff(&config(), "", ""),
             Err(GitError::NothingStaged)
         ));
+    }
+
+    #[test]
+    fn a_body_of_only_trailers_counts_as_no_body() {
+        let log = "\x1eAdd login\n\nCo-authored-by: A <a@x.dev>\nSigned-off-by: B <b@x.dev>\n\
+                   \x1eFix race\nThe lock was taken twice.\n\nCo-authored-by: A <a@x.dev>\n\
+                   \x1eBump version\n";
+
+        let commits = parse_log(log);
+
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].body, "");
+        assert_eq!(commits[1].body, "The lock was taken twice.");
+        assert_eq!(commits[2].subject, "Bump version");
+        assert_eq!(commits[2].body, "");
     }
 }

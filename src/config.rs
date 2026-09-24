@@ -53,6 +53,7 @@ pub struct Layer {
     pub api_key_file: Option<PathBuf>,
     pub endpoint_file: Option<PathBuf>,
     pub context_commits: Option<usize>,
+    pub self_emails: Option<Vec<String>>,
     pub max_diff_bytes: Option<usize>,
     pub max_file_diff_bytes: Option<usize>,
     pub max_tool_calls: Option<u32>,
@@ -99,6 +100,7 @@ impl Layer {
             api_key_file,
             endpoint_file,
             context_commits,
+            self_emails,
             max_diff_bytes,
             max_file_diff_bytes,
             max_tool_calls,
@@ -120,6 +122,9 @@ pub struct Config {
     pub api_key_file: Option<PathBuf>,
     pub endpoint_file: Option<PathBuf>,
     pub context_commits: usize,
+    /// Your own addresses. When set, the commit examples are your commits
+    /// rather than whoever committed last.
+    pub self_emails: Vec<String>,
     pub max_diff_bytes: usize,
     pub max_file_diff_bytes: usize,
     pub max_tool_calls: u32,
@@ -140,6 +145,7 @@ impl Default for Config {
             api_key_file: None,
             endpoint_file: None,
             context_commits: 10,
+            self_emails: Vec::new(),
             max_diff_bytes: 60_000,
             max_file_diff_bytes: 12_000,
             max_tool_calls: 2,
@@ -237,6 +243,7 @@ impl Config {
             api_key_file: layer.api_key_file,
             endpoint_file: layer.endpoint_file,
             context_commits: layer.context_commits.unwrap_or(defaults.context_commits),
+            self_emails: layer.self_emails.unwrap_or(defaults.self_emails),
             max_diff_bytes: layer.max_diff_bytes.unwrap_or(defaults.max_diff_bytes),
             max_file_diff_bytes: layer
                 .max_file_diff_bytes
@@ -290,6 +297,7 @@ impl Config {
             "endpoint_file" => show_path(self.endpoint_file.as_deref()),
             "api_key_file" => show_path(self.api_key_file.as_deref()),
             "context_commits" => self.context_commits.to_string(),
+            "self_emails" => self.self_emails.join(", "),
             "max_diff_bytes" => self.max_diff_bytes.to_string(),
             "max_file_diff_bytes" => self.max_file_diff_bytes.to_string(),
             "max_tool_calls" => self.max_tool_calls.to_string(),
@@ -310,6 +318,7 @@ impl Config {
         "api_key_file",
         "endpoint_file",
         "context_commits",
+        "self_emails",
         "max_diff_bytes",
         "max_file_diff_bytes",
         "max_tool_calls",
@@ -377,10 +386,10 @@ fn parse_value(key: &str, value: &str) -> Result<toml::Value, ConfigError> {
             toml::Value::String(value.to_owned())
         }
         "conventional_commits" | "body" => toml::Value::Boolean(value.parse().map_err(|_| bad())?),
-        "exclude" => toml::Value::Array(
+        "exclude" | "self_emails" => toml::Value::Array(
             value
                 .split(',')
-                .map(|glob| toml::Value::String(glob.trim().to_owned()))
+                .map(|item| toml::Value::String(item.trim().to_owned()))
                 .collect(),
         ),
         _ => toml::Value::Integer(value.parse().map_err(|_| bad())?),

@@ -96,7 +96,7 @@ pub async fn run(
         let paths = diff.paths();
 
         let (recent, touching, template, branch) = tokio::join!(
-            git::recent_commits(config.context_commits),
+            git::recent_commits(config.context_commits, &config.self_emails),
             git::commits_touching(&paths, config.context_commits),
             git::commit_template(&root),
             git::branch_name(),
@@ -104,10 +104,7 @@ pub async fn run(
 
         // How many commit examples actually reached the prompt, which is not
         // the configured count when the repository is younger than that.
-        let commits_used = recent
-            .as_deref()
-            .map_or(0, |log| log.lines().filter(|line| *line == "---").count())
-            + touching.as_deref().map_or(0, |log| log.lines().count());
+        let commits_used = recent.len() + touching.as_deref().map_or(0, |log| log.lines().count());
 
         let (added, deleted) = diff.totals();
 
@@ -125,9 +122,9 @@ pub async fn run(
         // Each rejected round stays in the conversation, so a second attempt
         // knows what it already proposed and why you did not want it.
         let mut messages = vec![
-            model::system(system_prompt(&config, args)),
+            model::system(system_prompt(&config, args, body_allowed(&config, &recent))),
             model::user(context_prompt(
-                recent.as_deref(),
+                &recent,
                 touching.as_deref(),
                 template.as_deref(),
                 branch.as_deref(),
@@ -448,11 +445,23 @@ fn body_lines(message: &Message) -> Vec<String> {
         .collect()
 }
 
+/// A history that almost never carries a body outranks the `body` setting.
+/// Asked to explain itself, a model writes a body every time, so the
+/// instruction to match the examples is not enough on its own.
+fn body_allowed(config: &Config, recent: &[git::PastCommit]) -> bool {
+    let with_body = recent
+        .iter()
+        .filter(|commit| !commit.body.is_empty())
+        .count();
+
+    config.body && with_body * 5 >= recent.len()
+}
+
 /// The two paths ask for different shapes, so they need different
 /// instructions. Telling a model to "reply with the message and nothing else"
 /// while handing it a schema that wants an array of them is a contradiction,
 /// and a model that resolves it by returning an empty array is not wrong.
-fn system_prompt(config: &Config, args: &CommitArgs) -> String {
+fn system_prompt(config: &Config, args: &CommitArgs, body: bool) -> String {
     let mut prompt = String::from(
         "You are an experienced programmer writing the commit message for a staged change.\n\n",
     );
@@ -479,7 +488,7 @@ fn system_prompt(config: &Config, args: &CommitArgs) -> String {
         config.subject_max_len
     );
 
-    match (config.body, config.candidates <= 1) {
+    match (body, config.candidates <= 1) {
         (true, true) => prompt.push_str(
             "\nThen a blank line, then a body explaining why the change was made, wrapped at 72 \
              characters. Leave the body out when the subject already says everything.",
@@ -524,7 +533,7 @@ fn system_prompt(config: &Config, args: &CommitArgs) -> String {
 /// Context first, diff last. The stable part of the prompt sits at the front
 /// so a provider that caches prefixes can reuse it between runs.
 fn context_prompt(
-    recent: Option<&str>,
+    recent: &[git::PastCommit],
     touching: Option<&str>,
     template: Option<&str>,
     branch: Option<&str>,
@@ -532,11 +541,20 @@ fn context_prompt(
 ) -> String {
     let mut prompt = String::new();
 
-    if let Some(recent) = recent {
-        let _ = write!(
-            prompt,
-            "# Recent commits in this repository\n\n{recent}\n\n"
-        );
+    if !recent.is_empty() {
+        prompt.push_str("# Recent commits in this repository\n\n");
+
+        for commit in recent {
+            let _ = writeln!(prompt, "{}", commit.subject);
+
+            if !commit.body.is_empty() {
+                let _ = writeln!(prompt, "{}", commit.body);
+            }
+
+            prompt.push_str("---\n");
+        }
+
+        prompt.push('\n');
     }
 
     if let Some(touching) = touching {
