@@ -15,7 +15,7 @@ authors = [
 ]
 
 [dependencies]
-async-openai = { version = "0.41", default-features = false, features = ["chat-completion", "native-tls", "byot"] }
+async-openai = { version = "0.42", default-features = false, features = ["chat-completion", "native-tls", "byot"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 futures = "0.3"
 globset = "0.4"
